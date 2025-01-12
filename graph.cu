@@ -21,14 +21,15 @@
 
 #include "gpu_graph.hpp"
 #include "cuda_helper.hpp"
+#include <iostream>
 
-constexpr int n_kernel = 2;
-constexpr int n_iteration = 40000;
+constexpr int n_kernel = 10;
+constexpr int n_iteration = 10000;
 
 __global__ void shortKernel(float *out_d, const float *in_d, int N, float f){
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if(idx < N) { 
-      out_d[idx] = f * in_d[idx];
+      out_d[idx] = out_d[idx] + f + in_d[idx];
   }
 }
 
@@ -56,21 +57,14 @@ void run_kernels_graph(float *out_d, float *in_d, int size, float f, gpu_graph_t
 
     if (g.state() == gpu_graph_t::state_t::capture) {
       // Static kernels
-      shortKernel<<<blocks, threads, 0, s>>>(out_d, in_d, size, 1.004f);
-      shortKernel<<<blocks, threads, 0, s>>>(in_d, out_d, size, 1.004f);
+      shortKernel<<<blocks, threads, 0, s>>>(out_d, in_d, size, 1.f);
 
-      // kernels with dynamic parameter `f`
-      // Add the kernel nodes
+      // // kernels with dynamic parameter `f`
+      // // Add the kernel nodes
       g.add_kernel_node(i * 2 + 0, params, s);
-      params.kernelParams[0] = &in_d;
-      params.kernelParams[1] = &out_d;
-      g.add_kernel_node(i * 2 + 1, params, s);
     } else if (g.state() == gpu_graph_t::state_t::update) {
       // Update the kernel nodes
       g.update_kernel_node(i * 2 + 0, params);
-      params.kernelParams[0] = &in_d;
-      params.kernelParams[1] = &out_d;
-      g.update_kernel_node(i * 2 + 1, params);
     }
   } 
 }
@@ -82,12 +76,10 @@ void run_kernels_no_graph(float *out_d, float *in_d, int size, float f, cudaStre
 
   for(int i = 0; i < n_kernel; i++){
     // Static kernels
-    shortKernel<<<blocks, threads, 0, s>>>(out_d, in_d, size, 1.004f);
-    shortKernel<<<blocks, threads, 0, s>>>(in_d, out_d, size, 1.004f);
+    shortKernel<<<blocks, threads, 0, s>>>(out_d, in_d, size, 1.f);
 
     // kernels with dynamic parameter `f`
     shortKernel<<<blocks, threads, 0, s>>>(out_d, in_d, size, f);
-    shortKernel<<<blocks, threads, 0, s>>>(in_d, out_d, size, f);
   } 
 }
 
@@ -95,6 +87,15 @@ void run_init(float *ptr, int size, float f, cudaStream_t s) {
   constexpr int threads = 256;
   int blocks = (size + threads - 1) / threads;
   initKernel<<<blocks, threads, 0, s>>>(ptr, size, f);
+}
+
+void sync_and_print_output(float* out, float* out_d, int size) {
+  cudaMemcpy(out, out_d, size * sizeof(float), cudaMemcpyDeviceToHost);
+
+  for (int i = 0; i < size; i++) {
+    std::cout << out[i] << ",";
+  }
+  std::cout << "\n";
 }
 
 int main() 
@@ -114,13 +115,15 @@ int main()
   cudaErrCheck(cudaMalloc(&out_d, bytes));
   cudaErrCheck(cudaMalloc(&in_d, bytes));
 
+  float out[size];
+
   cudaStream_t stream;
   cudaEvent_t start, stop;
   cudaErrCheck(cudaStreamCreate(&stream));
   cudaErrCheck(cudaEventCreate(&start));
   cudaErrCheck(cudaEventCreate(&stop));
 
-  float scale = 1.0f;
+  float scale = 1.f;
 
   auto wrap_obj_graph = [&](gpu_graph_t &g, cudaStream_t s) {
     run_kernels_graph(out_d, in_d, size, scale, g, s);
@@ -139,7 +142,7 @@ int main()
   cudaErrCheck(cudaEventRecord(start, stream));
 
   for(int i = 0; i < n_iteration; i++){
-    scale = 1.0f + i * 0.001f;
+    scale = i * 0.001f;
     _graph_always_recapture.wrap(wrap_obj_no_graph, stream);
   }
 
@@ -148,6 +151,8 @@ int main()
 
   float milliseconds;
   cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
+
+  sync_and_print_output(out, out_d, size);
 
   printf("Running with    CUDA graph ('Recapture-then-update') took %6.2f ms\n", milliseconds);
 
@@ -160,7 +165,7 @@ int main()
   cudaErrCheck(cudaEventRecord(start, stream));
 
   for(int i = 0; i < n_iteration; i++){
-    scale = 1.0f + i * 0.001f;
+    scale = i * 0.001f;
     _graph.wrap(wrap_obj_graph, stream);
   }
 
@@ -168,6 +173,8 @@ int main()
   cudaErrCheck(cudaEventSynchronize(stop));
 
   cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
+
+  sync_and_print_output(out, out_d, size);
 
   printf("Running with    CUDA graph ('Combined Approach')     took %6.2f ms\n", milliseconds);
 
@@ -179,7 +186,7 @@ int main()
   cudaErrCheck(cudaEventRecord(start, stream));
 
   for(int i = 0; i < n_iteration; i++){
-    scale = 1.0f + i * 0.001f;
+    scale = i * 0.001f;
     run_kernels_no_graph(out_d, in_d, size, scale, stream);
   }
 
@@ -187,6 +194,8 @@ int main()
   cudaErrCheck(cudaEventSynchronize(stop));
 
   cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
+
+  sync_and_print_output(out, out_d, size);
 
   printf("Running without CUDA graph                           took %6.2f ms\n", milliseconds);
 
