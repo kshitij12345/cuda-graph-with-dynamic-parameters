@@ -45,10 +45,10 @@ void gpu_graph_t::end_capture(cudaStream_t s) {
 
   if (_instantiated) {
     cudaGraphExecUpdateResult updateResult;
-    cudaGraphNode_t errorNode;
+    cudaGraphExecUpdateResultInfo errorNode;
     // First we try to update the graph as this is much cheaper than re-instantiation
-    cudaErrCheck(cudaGraphExecUpdate(_graph_exec, _graph, &errorNode, &updateResult));
-    if (_graph_exec == nullptr || updateResult != cudaGraphExecUpdateSuccess) {
+    cudaErrCheck(cudaGraphExecUpdate(_graph_exec, _graph, &errorNode));
+    if (_graph_exec == nullptr || errorNode.result != cudaGraphExecUpdateSuccess) {
       // The update is unsuccessful, need to re-instantiate
       cudaGetLastError(); // <- Clear the error state
       if (_graph_exec != nullptr) { cudaErrCheck(cudaGraphExecDestroy(_graph_exec)); }
