@@ -22,9 +22,13 @@
 #include "gpu_graph.hpp"
 #include "cuda_helper.hpp"
 #include <iostream>
+#include <ATen/cuda/CUDAEvent.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/torch.h>
 
 constexpr int n_kernel = 10;
-constexpr int n_iteration = 10000;
+constexpr int n_iteration = 1;
 
 __global__ void shortKernel(float *out_d, const float *in_d, int N, float f){
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -98,6 +102,19 @@ void sync_and_print_output(float* out, float* out_d, int size) {
   std::cout << "\n";
 }
 
+void fn(
+    torch::Tensor& x) {
+  x.sin_();
+}
+
+void stream_sync(
+    at::cuda::CUDAStream& dependency,
+    at::cuda::CUDAStream& dependent) {
+  at::cuda::CUDAEvent cuda_ev;
+  cuda_ev.record(dependency);
+  cuda_ev.block(dependent);
+}
+
 int main() 
 {
   gpu_graph_t _graph;
@@ -105,105 +122,46 @@ int main()
 
   _graph_always_recapture._always_recapture = true;
 
-  // Set up memory, stream, events
-  float *out_d = nullptr;
-  float *in_d = nullptr;
+  torch::manual_seed(1);
+  torch::cuda::manual_seed(1);
+  torch::Device device(torch::kCUDA);
+  auto x = torch::ones({3, 3}).to(device);
 
-  int size = 32;
-  size_t bytes = size * sizeof(float);
+  auto output = torch::randn({3, 3}).to(device);
+  std::cout << x << std::endl;
 
-  cudaErrCheck(cudaMalloc(&out_d, bytes));
-  cudaErrCheck(cudaMalloc(&in_d, bytes));
-
-  float out[size];
-
-  cudaStream_t stream;
-  cudaEvent_t start, stop;
-  cudaErrCheck(cudaStreamCreate(&stream));
-  cudaErrCheck(cudaEventCreate(&start));
-  cudaErrCheck(cudaEventCreate(&stop));
-
-  float scale = 1.f;
-
-  auto wrap_obj_graph = [&](gpu_graph_t &g, cudaStream_t s) {
-    run_kernels_graph(out_d, in_d, size, scale, g, s);
-  };
-
-  auto wrap_obj_no_graph = [&](gpu_graph_t &g, cudaStream_t s) {
-    run_kernels_no_graph(out_d, in_d, size, scale, stream);
-  };
-
-  run_init(out_d, size, 1.0f, stream);
-  run_init(in_d, size, 1.0f, stream);
+  auto captureStream = at::cuda::getStreamFromPool();
+  auto stream = at::cuda::getCurrentCUDAStream();
+  stream_sync(stream, captureStream);
+  at::cuda::setCurrentCUDAStream(captureStream);
 
   printf("Running with    CUDA graph ('Recapture-then-update') ...\n");
 
-  // Running the test with graph
-  cudaErrCheck(cudaEventRecord(start, stream));
+  auto wrap_obj_no_graph = [&](gpu_graph_t &g, cudaStream_t s) {
+    fn(x);
+  };
 
-  for(int i = 0; i < n_iteration; i++){
-    scale = i * 0.001f;
-    _graph_always_recapture.wrap(wrap_obj_no_graph, stream);
-  }
+  wrap_obj_no_graph(_graph_always_recapture, captureStream);
 
-  cudaErrCheck(cudaEventRecord(stop, stream));
-  cudaErrCheck(cudaEventSynchronize(stop));
+  std::cout << x << std::endl;
 
-  float milliseconds;
-  cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
+  x.fill_(1);
 
-  sync_and_print_output(out, out_d, size);
+  _graph_always_recapture.wrap(wrap_obj_no_graph, captureStream);
 
-  printf("Running with    CUDA graph ('Recapture-then-update') took %6.2f ms\n", milliseconds);
+  std::cout << x << std::endl;
 
-  run_init(out_d, size, 1.0f, stream);
-  run_init(in_d, size, 1.0f, stream);
+  x = torch::zeros({3, 3}).to(device);
+  x.fill_(0.5);
+  _graph_always_recapture.wrap(wrap_obj_no_graph, captureStream);
 
-  printf("Running with    CUDA graph ('Combined Approach')     ...\n");
-
-  // Running the test with graph
-  cudaErrCheck(cudaEventRecord(start, stream));
-
-  for(int i = 0; i < n_iteration; i++){
-    scale = i * 0.001f;
-    _graph.wrap(wrap_obj_graph, stream);
-  }
-
-  cudaErrCheck(cudaEventRecord(stop, stream));
-  cudaErrCheck(cudaEventSynchronize(stop));
-
-  cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
-
-  sync_and_print_output(out, out_d, size);
-
-  printf("Running with    CUDA graph ('Combined Approach')     took %6.2f ms\n", milliseconds);
-
-  run_init(out_d, size, 1.0f, stream);
-  run_init(in_d, size, 1.0f, stream);
-
-  printf("Running without CUDA graph                           ...\n");
-
-  cudaErrCheck(cudaEventRecord(start, stream));
-
-  for(int i = 0; i < n_iteration; i++){
-    scale = i * 0.001f;
-    run_kernels_no_graph(out_d, in_d, size, scale, stream);
-  }
-
-  cudaErrCheck(cudaEventRecord(stop, stream));
-  cudaErrCheck(cudaEventSynchronize(stop));
-
-  cudaErrCheck(cudaEventElapsedTime(&milliseconds, start, stop));
-
-  sync_and_print_output(out, out_d, size);
-
-  printf("Running without CUDA graph                           took %6.2f ms\n", milliseconds);
+  std::cout << x << std::endl;
 
   // Finalize memory, stream, events
-  cudaErrCheck(cudaStreamDestroy(stream));
-  cudaErrCheck(cudaEventDestroy(start));
-  cudaErrCheck(cudaEventDestroy(stop));
+  // cudaErrCheck(cudaStreamDestroy(stream));
+  // cudaErrCheck(cudaEventDestroy(start));
+  // cudaErrCheck(cudaEventDestroy(stop));
 
-  cudaErrCheck(cudaFree(out_d));
-  cudaErrCheck(cudaFree(in_d));
+  // cudaErrCheck(cudaFree(out_d));
+  // cudaErrCheck(cudaFree(in_d));
 }
